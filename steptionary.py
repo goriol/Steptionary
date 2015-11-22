@@ -1,67 +1,114 @@
 import os
-import sys
+import logging
 import sublime
 import sublime_plugin
 
-from functools import reduce
+from Steptionary.cache import cache
+from Steptionary.runner import Runner
 
-from Steptionary.persistence import save
+FEATURES = 'features'
+STEPS = 'steps'
 
-__file__ = os.path.normpath(os.path.abspath(__file__))
-__path__ = os.path.dirname(__file__)
+#
+# Dictionary of step definitions
+#
+class Steptionary:
 
-lib_path = os.path.join(__path__, 'lib')
-if lib_path not in sys.path:
-    sys.path.insert(0, lib_path)
+    dictionaries = {}
+    running_thread = None
 
-from gherkin3.parser import Parser
-from gherkin3.token_scanner import TokenScanner
-from gherkin3.errors import CompositeParserException
+    def refresh_steps(self, dictionary):
+        l = []
+        for f in dictionary[FEATURES]:
+            l += cache.get(f)
 
-class ExampleCommand(sublime_plugin.TextCommand):
-    def run(self, edit):
-        parser = Parser()
-        # Parse the whole buffer
-        content = sublime.Region(0, self.view.size())
-        feature = parser.parse(TokenScanner(self.view.substr(content)))
-        pos = self.view.sel()[0].begin()
-        print(feature['scenarioDefinitions'])
-        print(pos)
-        # self.view.replace(edit, content, feature.name)
+        dictionary[STEPS] = list(set(l))
 
-def pluck(iterable, prop):
-    return map(lambda item: item[prop], iterable)
+    # Initialize window's dictionary
+    def init(self, id):
+        self.dictionaries[id] = {STEPS: [], FEATURES: []}
 
-class ParseOnSave(sublime_plugin.EventListener):
-    def settings_get(self, name):
-        plugin_settings = sublime.load_settings('Steptionary.sublime-settings')
-        return plugin_settings.get(name)
+    # Add feature to the window's dictionary
+    def add(self, id, filename):
+        dictionary = self.dictionaries[id]
+        if filename not in dictionary[FEATURES]:
+            s = set(dictionary[FEATURES])
+            s.add(filename)
+            dictionary[FEATURES] = list(s)
 
-    def strip_comments(self, step):
-        comment = step.find('#')
-        if comment != -1:
-            return step[:comment].rstrip()
-        return step
+        self.refresh_steps(dictionary)
 
-    def filter_steps(self, defs):
-        f = lambda prev, curr: prev + list(map(self.strip_comments, pluck(curr['steps'], 'text')))
-        return reduce(f, defs, [])
+    # Update steps only if the dictionary contains this feature
+    def update(self, id, filename):
+        dictionary = self.dictionaries[id]
+        if filename in dictionary[FEATURES]:
+            self.refresh_steps(dictionary)
 
-    def save_steps(self, filename, defs):
-        steps = self.filter_steps(defs)
-        save(filename, steps)
+    def setup(self, id, folders):
+        def callback(filename):
+            self.add(id, filename)
 
-    def on_post_save_async(self, view):
-        expected_extension = self.settings_get('cucumber_features_extension')
-        filename, extension = os.path.splitext(view.file_name())
+        self.init(id)
+        if self.running_thread != None:
+            self.running_thread.stop()
 
-        if extension == expected_extension:
-            parser = Parser()
-            content = sublime.Region(0, view.size()) # Parse the whole buffer
-            try:
-                feature = parser.parse(TokenScanner(view.substr(content)))
-                defs = feature['scenarioDefinitions']
-                defs.append(feature['background'])
-                self.save_steps(view.file_name(), defs)
-            except CompositeParserException as e:
-                print(e)
+        self.running_thread = Runner(settings, folders, 30, callback)
+        self.running_thread.start()
+
+    def update_all(self, filename):
+        def callback(filename):
+            for id in self.dictionaries.keys():
+                self.update(id, filename)
+
+        if self.running_thread != None:
+            self.running_thread.stop()
+
+        self.running_thread = Runner(settings, filename, 30, callback)
+        self.running_thread.start()
+
+    def get_completions(self, id, prefix):
+        steps = self.dictionaries[id][STEPS]
+        completions = [(e,) * 2 for e in steps if e.find(prefix) != -1]
+        return completions
+
+    def is_feature(self, filename):
+        name, extension = os.path.splitext(filename)
+        if extension in settings.get('cucumber_feature_extensions'):
+            return True
+
+        return False
+
+#
+# Interface with Sublime Text
+#
+class Plugin(Steptionary, sublime_plugin.EventListener):
+
+    # Use this event to emulate the missing on_window_activated(window)
+    def on_activated(self, view):
+        window = view.window()
+        if window.id() not in self.dictionaries:
+            self.setup(window.id(), window.folders())
+
+    # on_post_save_async(view) is not available in ST2.
+    # Use on_post_save(view) with threading instead.
+    def on_post_save(self, view):
+        filename = view.file_name()
+        if self.is_feature(filename):
+            self.update_all(filename)
+
+    def on_query_completions(self, view, prefix, locations):
+        if self.is_feature(view.file_name()):
+            return (self.get_completions(view.window().id(), prefix), sublime.INHIBIT_WORD_COMPLETIONS & sublime.INHIBIT_EXPLICIT_COMPLETIONS)
+
+        return None
+
+#
+# Plugin initialization
+#
+def plugin_loaded():
+    global settings
+    settings = sublime.load_settings('Steptionary.sublime-settings')
+
+# ST2 backward compatibility
+if int(sublime.version()) < 3000:
+    sublime.set_timeout(lambda: plugin_loaded(), 0)

@@ -1,3 +1,4 @@
 {
-    "cucumber_features_extension": ".feature"
+    "cucumber_feature_extensions": [".feature"],
+    "folder_exclude_patterns": [".git", "node_modules"]
 }
